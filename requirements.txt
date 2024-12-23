@@ -1,0 +1,5 @@
+pydub
+langdetect
+pysub-parser
+audioop-lts
+vosk
