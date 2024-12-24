@@ -1,171 +1,79 @@
-import torch
-import torchaudio
-import subprocess
-import os
-from speechbrain.pretrained import EncoderClassifier
+#!/usr/bin/env python3
+
+import argparse
+import json
+import sys
 from pathlib import Path
-import tempfile
+from language_detector.audio_detector import AudioLanguageDetector
+from language_detector.mkv_processor import MKVProcessor
 
 
-class AudioLanguageDetector:
-    def __init__(self):
-        """Initialize the language detector with VoxLingua107 model"""
-        self.classifier = EncoderClassifier.from_hparams(
-            source="speechbrain/lang-id-voxlingua107-ecapa", savedir="tmp/voxlingua107"
-        )
-        self.language_mapping = {"en": "English", "ru": "Russian"}
-
-    def extract_audio(self, mkv_file, output_dir=None):
-        """
-        Extract audio from MKV file to WAV format
-        Returns path to extracted audio file
-        """
-        if output_dir is None:
-            output_dir = tempfile.gettempdir()
-
-        output_path = os.path.join(output_dir, f"{Path(mkv_file).stem}_audio.wav")
-
-        # FFmpeg command to extract audio and convert to WAV
-        command = [
-            "ffmpeg",
-            "-i",
-            mkv_file,  # Input file
-            "-vn",  # Disable video
-            "-acodec",
-            "pcm_s16le",  # Convert to PCM WAV
-            "-ar",
-            "16000",  # Set sample rate to 16kHz
-            "-ac",
-            "1",  # Convert to mono
-            "-y",  # Overwrite output file if exists
-            output_path,
-        ]
-
-        try:
-            subprocess.run(command, check=True, capture_output=True)
-            return output_path
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Failed to extract audio: {e.stderr.decode()}")
-
-    def detect_language(self, audio_file, segment_duration=30):
-        """
-        Detect language from audio file using VoxLingua107.
-        Args:
-            audio_file: Path to audio file
-            segment_duration: Duration in seconds for each segment to analyze
-        Returns dictionary with detected language and confidence score
-        """
-        signal, fs = torchaudio.load(audio_file)
-
-        # Convert segment duration to samples
-        segment_len = segment_duration * fs
-        num_segments = signal.shape[1] // segment_len
-
-        results = []
-        # Process each segment
-        for i in range(num_segments):
-            start = i * segment_len
-            end = start + segment_len
-            segment = signal[:, start:end]
-
-            # Make prediction
-            prediction = self.classifier.classify_batch(segment)
-
-            # Get the predicted language and score
-            language = prediction[0].argmax().item()
-            score = prediction[1].max().item()
-
-            predicted_lang = self.classifier.hparams.label_encoder.decode_ndim(language)
-            results.append(
-                {
-                    "language": self.language_mapping.get(
-                        predicted_lang, predicted_lang
-                    ),
-                    "confidence": score,
-                    "segment": i,
-                }
-            )
-
-        # Aggregate results
-        language_counts = {}
-        for result in results:
-            lang = result["language"]
-            language_counts[lang] = language_counts.get(lang, 0) + 1
-
-        # Get the most common language
-        dominant_language = max(language_counts.items(), key=lambda x: x[1])[0]
-
-        # Calculate average confidence for dominant language
-        confidence_scores = [
-            r["confidence"] for r in results if r["language"] == dominant_language
-        ]
-        avg_confidence = (
-            sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0
-        )
-
-        return {
-            "language": dominant_language,
-            "confidence": avg_confidence,
-            "segments": results,
-        }
-
-    def process_mkv(self, mkv_file, cleanup=True):
-        """
-        Process MKV file and detect language
-        Args:
-            mkv_file: Path to MKV file
-            cleanup: Whether to delete temporary WAV file after processing
-        """
-        try:
-            # Extract audio from MKV
-            wav_file = self.extract_audio(mkv_file)
-
-            # Detect language
-            result = self.detect_language(wav_file)
-
-            # Cleanup temporary file if requested
-            if cleanup:
-                os.remove(wav_file)
-
-            return result
-
-        except Exception as e:
-            if cleanup and "wav_file" in locals():
-                try:
-                    os.remove(wav_file)
-                except:
-                    pass
-            raise e
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Process MKV files to detect spoken language using subtitle timing"
+    )
+    parser.add_argument("mkv_file", type=str, help="Path to MKV file to process")
+    parser.add_argument(
+        "--save-srt", action="store_true", help="Save the extracted SRT file"
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        help="Path to previously downloaded language detection model",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        help="Output JSON file for results (defaults to {input_name}_results.json)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return parser.parse_args()
 
 
 def main():
-    import argparse
+    args = parse_args()
 
-    parser = argparse.ArgumentParser(description="Detect language in MKV file")
-    parser.add_argument("mkv_file", type=str, help="Path to MKV file")
-    parser.add_argument(
-        "--keep-wav",
-        action="store_true",
-        help="Keep extracted WAV file after processing",
-    )
-    args = parser.parse_args()
+    # Validate input file
+    mkv_path = Path(args.mkv_file)
+    if not mkv_path.exists():
+        print(f"Error: Input file does not exist: {mkv_path}")
+        sys.exit(1)
+
+    # Set up output path if not specified
+    if not args.output:
+        args.output = mkv_path.with_suffix(".results.json")
 
     try:
-        detector = AudioLanguageDetector()
-        result = detector.process_mkv(args.mkv_file, cleanup=not args.keep_wav)
+        # Initialize detector and processor
+        detector = AudioLanguageDetector(model_path=args.model_path)
+        processor = MKVProcessor(str(mkv_path))
 
-        print(f"\nDominant language: {result['language']}")
-        print(f"Average confidence: {result['confidence']:.2f}")
+        # Process the file
+        print(f"\nProcessing: {mkv_path}")
+        results = processor.process_with_detector(
+            detector, save_srt=args.save_srt, debug=args.debug
+        )
 
-        print("\nSegment analysis:")
-        for segment in result["segments"]:
-            print(
-                f"Segment {segment['segment']}: {segment['language']} "
-                f"(confidence: {segment['confidence']:.2f})"
-            )
+        # Print summary
+        print("\nProcessing Results:")
+        for result in results:
+            print(f"\nSegment {result['segment']}:")
+            print(f"Time: {result['start_time']:.2f}s - {result['end_time']:.2f}s")
+            print(f"Detected Language: {result['detected_language']}")
+            print(f"Confidence: {result['confidence']:.2f}")
+
+        # Save results
+        with open(args.output, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\nResults saved to: {args.output}")
 
     except Exception as e:
-        print(f"Error processing MKV file: {str(e)}")
+        print(f"Error processing file: {e}")
+        if args.debug:
+            import traceback
+
+            traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
